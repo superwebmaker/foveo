@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Rounded Background: Mint Green -->
+  <rect x="10" y="10" width="80" height="80" rx="24" fill="#4ECDC4" />
+  
+  <!-- Stylized F: White -->
+  <path d="M 35 30 H 65 A 5 5 0 0 1 70 35 V 40 A 5 5 0 0 1 65 45 H 45 V 50 H 60 A 5 5 0 0 1 65 55 V 60 A 5 5 0 0 1 60 65 H 45 V 75 A 5 5 0 0 1 40 80 H 35 A 5 5 0 0 1 30 75 V 35 A 5 5 0 0 1 35 30 Z" fill="#FFFFFF"/>
+  
+  <!-- Subtle Shadow/Detail for pop -->
+  <circle cx="70" cy="70" r="8" fill="#FF6B6B" opacity="0.9" />
+</svg>
