@@ -32,7 +32,8 @@ export async function onRequest(context) {
 
   // 3. 跨域 (CORS) 与 鉴权 (Auth)
   const origin = request.headers.get('Origin');
-  const isAllowedOrigin = checkOrigin(origin, env.ALLOWED_ORIGINS);
+  const isSameOrigin = origin ? origin === url.origin : false;
+  const isAllowedOrigin = isSameOrigin || checkOrigin(origin, env.ALLOWED_ORIGINS);
 
   // 处理 Preflight 请求
   if (request.method === 'OPTIONS') {
@@ -50,7 +51,7 @@ export async function onRequest(context) {
   }
 
   // 混合鉴权逻辑
-  if (origin && isAllowedOrigin) {
+  if (isAllowedOrigin) {
     // 情况 A：来自受信前端项目的浏览器请求，放行（靠 Origin 保护）
   } else {
     // 情况 B：来自脚本或其他后端项目，必须校验网关密钥
