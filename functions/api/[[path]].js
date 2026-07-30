@@ -1,108 +1,108 @@
 /**
- * 通用 LLM API 网关 - Cloudflare Pages Functions 版本
- * 支持全路径转发、流式响应、跨域管控、多租户鉴权
+ * 通用 Cloudflare Pages Functions LLM API 网关代理
+ *
+ * 核心功能：
+ * 1. 代理前端发起的 `/api/*` 请求至配置的 `UPSTREAM_API_URL`
+ * 2. 自动注入 `UPSTREAM_API_KEY` (Bearer Token)
+ * 3. 智能兼容 `/v1` 路径重叠与协议头缺失问题
+ * 4. 灵活参数覆盖与多模型别名映射机制：
+ *    - 上游地址：前端 Header `X-Upstream-Url` > 环境变量 `UPSTREAM_API_URL`
+ *    - API Key：前端 Header `X-Upstream-Key` > 环境变量 `UPSTREAM_API_KEY`
+ *    - 模型映射优先级：
+ *        ① 前端请求 model 在 `API_MODEL_MAP` (JSON) 中的映射
+ *        ② 环境变量 `API_MODEL_<NAME>` (如 API_MODEL_PRO)
+ *        ③ 前端请求原样模型
+ *        ④ 环境变量 `API_MODEL` 兜底
+ * 5. 全功能支持 CORS Preflight 及 SSE 流式响应 (Stream)
  */
 
 export async function onRequest(context) {
   const { request, env, params } = context;
-  const url = new URL(request.url);
+  const origin = request.headers.get('Origin') || '*';
 
-  // 1. 环境参数检查
-  const upstreamUrl = env.UPSTREAM_API_URL;
-  const upstreamKey = env.UPSTREAM_API_KEY;
-  if (!upstreamUrl || !upstreamKey) {
-    return jsonError("Gateway configuration error: Missing Upstream URL or Key", 500);
-  }
-
-  // 2. 路径处理：从 URL 中提取完整路径
-  // 例如：/api/v1/chat/completions -> /v1/chat/completions
-  const apiPrefix = '/api';
-  const fullPath = url.pathname.startsWith(apiPrefix) 
-    ? url.pathname.slice(apiPrefix.length) 
-    : url.pathname;
-  
-  // 构建目标 URL
-  const targetUrl = new URL(upstreamUrl.replace(/\/+$/, '') + fullPath);
-  targetUrl.search = url.search;
-
-  // 安全屏蔽：防止泄露模型列表或进行未授权探测
-  if (fullPath.endsWith('/models') || fullPath === '/v1/models') {
-    return jsonError("Model listing is disabled for security", 403);
-  }
-
-  // 3. 跨域 (CORS) 与 鉴权 (Auth)
-  const origin = request.headers.get('Origin');
-  const isSameOrigin = origin ? origin === url.origin : false;
-  const isAllowedOrigin = isSameOrigin || checkOrigin(origin, env.ALLOWED_ORIGINS);
-
-  // 处理 Preflight 请求
+  // 1. 处理 CORS Preflight 预检请求
   if (request.method === 'OPTIONS') {
-    if (isAllowedOrigin) {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': origin,
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Max-Age': '86400',
-        },
-      });
-    }
-    return jsonError("Forbidden: Origin not allowed", 403);
+    return new Response(null, {
+      status: 204,
+      headers: {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, X-Upstream-Url, X-Upstream-Key',
+        'Access-Control-Max-Age': '86400',
+      },
+    });
   }
 
-  // 混合鉴权逻辑
-  if (isAllowedOrigin) {
-    // 情况 A：来自受信前端项目的浏览器请求，放行（靠 Origin 保护）
-  } else {
-    // 情况 B：来自脚本或其他后端项目，必须校验网关密钥
-    const clientKey = extractBearerToken(request.headers.get('Authorization'));
-    const validKeys = (env.GATEWAY_API_KEYS || "").split(',').map(k => k.trim());
-    
-    if (!clientKey || !validKeys.includes(clientKey)) {
-      return jsonError("Unauthorized: Valid Gateway API Key required", 401);
-    }
+  // 2. 解析与覆盖上游 URL 和 Key
+  const customUpstreamUrl = request.headers.get('X-Upstream-Url');
+  const customUpstreamKey = request.headers.get('X-Upstream-Key');
+
+  const upstreamUrl = (customUpstreamUrl && customUpstreamUrl.trim()) || env.UPSTREAM_API_URL;
+  const upstreamKey = (customUpstreamKey && customUpstreamKey.trim()) || env.UPSTREAM_API_KEY;
+
+  if (!upstreamUrl || !upstreamKey) {
+    return jsonError(
+      "Gateway Configuration Error: Missing UPSTREAM_API_URL or UPSTREAM_API_KEY in Cloudflare Pages environment variables.",
+      500,
+      origin
+    );
   }
 
-  // 4. 构建转发请求
+  // 3. 智能拼接目标上游 URL
+  const subPath = params.path ? '/' + params.path.join('/') : '';
+  const targetUrl = buildTargetUrl(upstreamUrl, subPath, request.url);
+
+  // 4. 构建代理请求头
   const proxyHeaders = new Headers(request.headers);
   proxyHeaders.set('Authorization', `Bearer ${upstreamKey}`);
   proxyHeaders.delete('Host');
   proxyHeaders.delete('CF-Connecting-IP');
+  proxyHeaders.delete('CF-IPCountry');
+  proxyHeaders.delete('CF-Ray');
+  proxyHeaders.delete('CF-Visitor');
+  proxyHeaders.delete('X-Upstream-Url');
+  proxyHeaders.delete('X-Upstream-Key');
 
+  // 5. 请求 Body 处理与多模型映射逻辑
+  let requestBody = request.body;
+
+  if (
+    ['POST', 'PUT', 'PATCH'].includes(request.method) &&
+    isJsonContent(request.headers.get('content-type'))
+  ) {
+    try {
+      const rawText = await request.text();
+      if (rawText.trim()) {
+        const bodyObj = JSON.parse(rawText);
+        if (typeof bodyObj === 'object' && bodyObj !== null) {
+          const finalModel = resolveModel(bodyObj.model, env);
+          if (finalModel) {
+            bodyObj.model = finalModel;
+          }
+          requestBody = JSON.stringify(bodyObj);
+          proxyHeaders.set('Content-Type', 'application/json');
+        }
+      }
+    } catch (e) {
+      // Body 解析失败时使用原始 body 传输
+    }
+  }
+
+  // 6. 发送代理请求
   const proxyRequest = new Request(targetUrl.toString(), {
     method: request.method,
     headers: proxyHeaders,
-    body: request.body,
+    body: requestBody,
     redirect: 'follow',
   });
 
   try {
     const response = await fetch(proxyRequest);
-    
-    // 5. 处理响应：支持流式传输
-    const responseHeaders = new Headers(response.headers);
-    if (isAllowedOrigin && origin) {
-      responseHeaders.set('Access-Control-Allow-Origin', origin);
-    }
 
-    // Log errors for debugging
-    if (!response.ok) {
-      console.error(`Upstream error: ${response.status} ${response.statusText}`);
-      console.error(`Target URL: ${targetUrl.toString()}`);
-      const errorBody = await response.text();
-      console.error(`Error body: ${errorBody}`);
-      
-      return new Response(errorBody || JSON.stringify({ 
-        error: { 
-          message: `Upstream API error: ${response.status} ${response.statusText}`,
-          status: response.status 
-        } 
-      }), {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
-      });
-    }
+    // 7. 返回响应，附加 CORS 标头并保留流式通道 (Response.body)
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set('Access-Control-Allow-Origin', origin);
+    responseHeaders.set('Access-Control-Allow-Credentials', 'true');
 
     return new Response(response.body, {
       status: response.status,
@@ -110,36 +110,98 @@ export async function onRequest(context) {
       headers: responseHeaders,
     });
   } catch (err) {
-    console.error(`Gateway fetch error: ${err.message}`);
-    console.error(`Target URL: ${targetUrl.toString()}`);
-    return jsonError(`Gateway Error: ${err.message}`, 502);
+    return jsonError(`Gateway Proxy Error: ${err.message}`, 502, origin);
   }
 }
 
-// --- 辅助函数 ---
+// --- 辅助工具函数 ---
 
-function jsonError(message, status) {
-  return new Response(JSON.stringify({ error: { message, status } }), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
+/**
+ * 智能模型解析与映射中心
+ */
+function resolveModel(incomingModel, env) {
+  const modelStr = (incomingModel || '').trim();
 
-function checkOrigin(origin, allowedStr) {
-  if (!origin || !allowedStr) return false;
-  const allowed = allowedStr.split(',').map(o => o.trim());
-  return allowed.some(pattern => {
-    if (pattern === origin) return true;
-    if (pattern.includes('*')) {
-      const regex = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*/g, '[a-zA-Z0-9-]+') + '$');
-      return regex.test(origin);
+  // 1. 尝试从 JSON 映射表 API_MODEL_MAP 中解析
+  if (env.API_MODEL_MAP) {
+    try {
+      const map = typeof env.API_MODEL_MAP === 'string' ? JSON.parse(env.API_MODEL_MAP) : env.API_MODEL_MAP;
+      if (modelStr && map[modelStr]) {
+        return map[modelStr];
+      }
+      if (!modelStr && map['default']) {
+        return map['default'];
+      }
+    } catch (e) {
+      console.error("Failed to parse API_MODEL_MAP:", e);
     }
-    return false;
-  });
+  }
+
+  // 2. 尝试从动态环境变量查找 (如 model="pro" -> 环境变量 API_MODEL_PRO)
+  if (modelStr) {
+    const envKey = `API_MODEL_${modelStr.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}`;
+    if (env[envKey]) {
+      return env[envKey];
+    }
+    // 前端传递了具体模型标识且无特殊映射，直接使用
+    return modelStr;
+  }
+
+  // 3. 兜底使用单模型变量 API_MODEL
+  return env.API_MODEL || undefined;
 }
 
-function extractBearerToken(header) {
-  if (!header) return null;
-  const [type, token] = header.split(' ');
-  return type.toLowerCase() === 'bearer' ? token : null;
+/**
+ * 智能拼接目标 URL，自动规避重复 /v1 前缀与缺失协议头
+ */
+function buildTargetUrl(baseUrl, subPath, requestUrlStr) {
+  let cleanBase = (baseUrl || '').trim().replace(/\/+$/, '');
+
+  // 自动补全 http:// 或 https://
+  if (!/^https?:\/\//i.test(cleanBase)) {
+    cleanBase = 'https://' + cleanBase;
+  }
+
+  let cleanSub = subPath;
+
+  // 处理 /v1 路径重复
+  if (cleanBase.endsWith('/v1') && cleanSub.startsWith('/v1')) {
+    cleanSub = cleanSub.replace(/^\/v1/, '');
+  }
+
+  const fullUrlStr = cleanBase + cleanSub;
+  const targetUrl = new URL(fullUrlStr);
+
+  // 保持原有 URL 的 Query 参数 (如 ?stream=true)
+  if (requestUrlStr) {
+    try {
+      const incomingUrl = new URL(requestUrlStr);
+      targetUrl.search = incomingUrl.search;
+    } catch (e) {}
+  }
+
+  return targetUrl;
+}
+
+function isJsonContent(contentType) {
+  return contentType && contentType.toLowerCase().includes('application/json');
+}
+
+function jsonError(message, status, origin = '*') {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: 'gateway_error',
+        status,
+      },
+    }),
+    {
+      status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': origin,
+      },
+    }
+  );
 }
