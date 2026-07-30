@@ -17,7 +17,23 @@
   <title>Foveo</title>
   <script type="module" crossorigin src="/assets/index-DC3UyEx_.js"></script>
   <link rel="stylesheet" crossorigin href="/assets/index-xq9xtinh.css">
-  <script defer src="https://insights.balmjs.com/script.js" data-website-id="73db3dc3-de5e-4216-a755-8c42cd074a42"></script>
+
+  <script>
+    window.addEventListener('load', function() {
+      try {
+        var el = document.createElement('script');
+        el.async = true;
+        el.src = 'https://insights.balmjs.com/script.js';
+        el.setAttribute('data-website-id', 'a53c581c-9820-44f1-b6ad-05744f2e9a62');
+        el.onerror = function() {
+          console.warn('[Analytics] Tracking script failed to load, analytics disabled.');
+        };
+        document.head.appendChild(el);
+      } catch (e) {
+        console.warn('[Analytics] Initialization error:', e);
+      }
+    });
+  </script>
   <link rel="manifest" href="/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
 
 <body>
